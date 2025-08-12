@@ -1,0 +1,18 @@
+embedding_model = "Qwen/Qwen3-Embedding-0.6B"
+device = "auto"
+
+[tasks."滑坡"]
+labels = ["有", "无"]
+model_path = "models/slippery_slope.joblib"
+
+[tasks."引战"]
+labels = ["有", "无"]
+model_path = "models/incitement.joblib"
+
+[tasks."拉踩"]
+labels = ["有", "无"]
+model_path = "models/unfair_comparison.joblib"
+
+[tasks."AI生成"]
+labels = ["是", "否"]
+model_path = "models/ai_generation.joblib"

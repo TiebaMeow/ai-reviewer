@@ -43,7 +43,7 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ## 配置说明
 
 ```toml
-embedding_model = "Qwen/Qwen3-Embedding-0.6B"
+embedding_model = "richinfoai/ritrieve_zh_v1"
 device = "auto"
 
 # 中文任务名请使用双引号
@@ -64,6 +64,14 @@ model_path = "models/slippery_slope.joblib"
 ```bash
 python batch_train.py --csv sample_data.csv --create-sample
 ```
+
+CSV文件格式：
+
+| 列 | 说明 | 示例 |
+|-----|------|------|
+| text | 要分类的文本内容 | "难道说？" |
+| task | 分类任务名称 | "滑坡" |
+| label | 对应的标签 | "无" |
 
 2. 运行批量训练
 
@@ -92,14 +100,6 @@ python batch_train.py \
 | `--no-auto-register` | `False` | 不自动注册新任务 |
 | `--create-sample` | `False` | 创建示例 CSV 文件 |
 
-### CSV文件格式
-
-| 列 | 说明 | 示例 |
-|-----|------|------|
-| text | 要分类的文本内容 | "难道说？" |
-| task | 分类任务名称 | "滑坡" |
-| label | 对应的标签 | "无" |
-
 ## API
 
 ### `GET /config`
@@ -110,7 +110,7 @@ python batch_train.py \
 
 ```json
 {
-  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "embedding_model": "richinfoai/ritrieve_zh_v1",
   "device": "cuda:0",
   "tasks": {
     "滑坡": {
@@ -229,42 +229,6 @@ python batch_train.py \
   "message": "task 滑坡 updated"
 }
 ```
-
-## 批量训练
-
-项目提供了 `batch_train.py` 脚本，支持从 CSV 文件批量导入训练数据：
-
-### 创建示例训练数据
-
-```bash
-uv run python batch_train.py --csv sample_data.csv --create-sample
-```
-
-### 批量训练使用
-
-```bash
-# 基本用法
-uv run python batch_train.py --csv training_data.csv
-
-# 自定义配置
-uv run python batch_train.py \
-    --csv training_data.csv \
-    --batch-size 20 \
-    --delay 0.2 \
-    --url http://localhost:8000
-```
-
-### CSV 文件格式
-
-```csv
-text,task,label
-这种观点会导致社会分裂,滑坡,有
-我认为这个政策很好,滑坡,无
-你这种想法就是想挑起争端,引战,是
-让我们理性讨论这个问题,引战,否
-```
-
-详细使用说明请参考 [BATCH_TRAINING_GUIDE.md](BATCH_TRAINING_GUIDE.md)
 
 ## 注意事项
 

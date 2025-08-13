@@ -55,6 +55,51 @@ model_path = "models/slippery_slope.joblib"
 
 ```
 
+## 批量训练脚本
+
+### 使用方法
+
+1. 创建示例 CSV 文件
+
+```bash
+python batch_train.py --csv sample_data.csv --create-sample
+```
+
+2. 运行批量训练
+
+```bash
+python batch_train.py --csv training_data.csv
+```
+
+3. 自定义参数
+
+```bash
+python batch_train.py \
+    --csv training_data.csv \
+    --url http://localhost:8000 \
+    --batch-size 20 \
+    --delay 0.2 \
+    --timeout 60
+```
+
+| 参数 | 默认值 | 说明 |
+|-----|--------|------|
+| `--csv` | 必需 | CSV 训练数据文件路径 |
+| `--url` | `http://localhost:8000` | AI Reviewer 服务 URL |
+| `--batch-size` | `50` | 每批处理的数据条数 |
+| `--delay` | `0.1` | 批次间延迟时间（秒） |
+| `--timeout` | `30` | 请求超时时间（秒） |
+| `--no-auto-register` | `False` | 不自动注册新任务 |
+| `--create-sample` | `False` | 创建示例 CSV 文件 |
+
+### CSV文件格式
+
+| 列 | 说明 | 示例 |
+|-----|------|------|
+| text | 要分类的文本内容 | "难道说？" |
+| task | 分类任务名称 | "滑坡" |
+| label | 对应的标签 | "无" |
+
 ## API
 
 ### `GET /config`
@@ -184,6 +229,42 @@ model_path = "models/slippery_slope.joblib"
   "message": "task 滑坡 updated"
 }
 ```
+
+## 批量训练
+
+项目提供了 `batch_train.py` 脚本，支持从 CSV 文件批量导入训练数据：
+
+### 创建示例训练数据
+
+```bash
+uv run python batch_train.py --csv sample_data.csv --create-sample
+```
+
+### 批量训练使用
+
+```bash
+# 基本用法
+uv run python batch_train.py --csv training_data.csv
+
+# 自定义配置
+uv run python batch_train.py \
+    --csv training_data.csv \
+    --batch-size 20 \
+    --delay 0.2 \
+    --url http://localhost:8000
+```
+
+### CSV 文件格式
+
+```csv
+text,task,label
+这种观点会导致社会分裂,滑坡,有
+我认为这个政策很好,滑坡,无
+你这种想法就是想挑起争端,引战,是
+让我们理性讨论这个问题,引战,否
+```
+
+详细使用说明请参考 [BATCH_TRAINING_GUIDE.md](BATCH_TRAINING_GUIDE.md)
 
 ## 注意事项
 

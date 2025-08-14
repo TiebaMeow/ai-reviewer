@@ -15,6 +15,7 @@ CSV文件格式：
 
 import argparse
 import csv
+import random
 import sys
 import time
 from pathlib import Path
@@ -171,7 +172,16 @@ class BatchTrainer:
             groups[task].append(item)
         return groups
 
-    def batch_train(self, csv_file: Path, batch_size: int = 50, delay: float = 0.1, auto_register: bool = True):
+    def batch_train(
+        self,
+        csv_file: Path,
+        batch_size: int = 50,
+        delay: float = 0.1,
+        auto_register: bool = True,
+        shuffle: bool = True,
+        seed: int | None = None,
+        epochs: int = 1,
+    ):
         """批量训练"""
         print(f"📁 加载CSV文件: {csv_file}")
 
@@ -197,7 +207,14 @@ class BatchTrainer:
         print(f"📊 发现 {len(task_groups)} 个不同的任务:")
 
         for task_name, items in task_groups.items():
-            labels = list({item["label"] for item in items})
+            # Preserve label order by first occurrence in CSV to ensure deterministic mapping
+            seen: set[str] = set()
+            labels: list[str] = []
+            for item in items:
+                lb = item["label"]
+                if lb not in seen:
+                    seen.add(lb)
+                    labels.append(lb)
             print(f"  - {task_name}: {len(items)} 条数据, 标签: {labels}")
 
             # 自动注册任务
@@ -206,31 +223,54 @@ class BatchTrainer:
                     print(f"⚠️  跳过任务 '{task_name}' 的训练")
                     continue
 
+        # 定义分层打乱与交替混合（按标签分桶并轮询取样）
+        def stratified_interleave(items: list[dict[str, str]], rnd: random.Random) -> list[dict[str, str]]:
+            buckets: dict[str, list[dict[str, str]]] = {}
+            for it in items:
+                buckets.setdefault(it["label"], []).append(it)
+            # 独立打乱每个标签桶
+            for arr in buckets.values():
+                rnd.shuffle(arr)
+            order = list(buckets.keys())
+            rnd.shuffle(order)
+            mixed: list[dict[str, str]] = []
+            # 轮询取样直到所有桶耗尽（每轮使用一次性 extend）
+            while any(buckets[k] for k in order):
+                round_elems = [buckets[k].pop() for k in order if buckets[k]]
+                mixed.extend(round_elems)
+            return mixed
+
         # 批量训练
         total_success = 0
         total_failed = 0
 
         for task_name, items in task_groups.items():
             print(f"\n🔄 开始训练任务: {task_name}")
+            # 进行多个 epoch 的分层打乱并分批提交
+            for ep in range(epochs):
+                rnd = random.Random((seed if seed is not None else random.randrange(1 << 30)) + ep)
+                items_epoch = stratified_interleave(items, rnd) if shuffle else list(items)
 
-            # 分批处理
-            for i in range(0, len(items), batch_size):
-                batch = items[i:i + batch_size]
-                texts = [item["text"] for item in batch]
-                labels = [item["label"] for item in batch]
+                for i in range(0, len(items_epoch), batch_size):
+                    batch = items_epoch[i:i + batch_size]
+                    texts = [item["text"] for item in batch]
+                    labels = [item["label"] for item in batch]
 
-                print(f"  批次 {i // batch_size + 1}: 处理 {len(batch)} 条数据...", end="")
+                    print(
+                        f"  Epoch {ep + 1}/{epochs} 批次 {i // batch_size + 1}: 处理 {len(batch)} 条数据...",
+                        end="",
+                    )
 
-                if self.update_task(texts, task_name, labels):
-                    print(" ✓")
-                    total_success += len(batch)
-                else:
-                    print(" ❌")
-                    total_failed += len(batch)
+                    if self.update_task(texts, task_name, labels):
+                        print(" ✓")
+                        total_success += len(batch)
+                    else:
+                        print(" ❌")
+                        total_failed += len(batch)
 
-                # 延迟避免过于频繁的请求
-                if delay > 0:
-                    time.sleep(delay)
+                    # 延迟避免过于频繁的请求
+                    if delay > 0:
+                        time.sleep(delay)
 
         # 总结
         print("\n📈 训练完成!")
@@ -268,6 +308,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=30, help="请求超时时间（秒）")
     parser.add_argument("--no-auto-register", action="store_true", help="不自动注册新任务")
     parser.add_argument("--create-sample", action="store_true", help="创建示例CSV文件")
+    parser.add_argument("--no-shuffle", action="store_true", help="不打乱样本（默认打乱并分层混合）")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子，用于重现实验")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（对同一CSV重复多轮）")
 
     args = parser.parse_args()
 
@@ -285,7 +328,10 @@ def main():
         csv_file=csv_file,
         batch_size=args.batch_size,
         delay=args.delay,
-        auto_register=not args.no_auto_register
+        auto_register=not args.no_auto_register,
+        shuffle=not args.no_shuffle,
+        seed=args.seed,
+        epochs=args.epochs,
     )
 
     sys.exit(0 if success else 1)

@@ -1,18 +1,10 @@
 embedding_model = "richinfoai/ritrieve_zh_v1"
 device = "auto"
 
-[tasks."滑坡"]
+[tasks."违规内容"]
 labels = ["无", "有"]
-model_path = "models/slippery_slope.joblib"
-
-[tasks."引战"]
-labels = ["无", "有"]
-model_path = "models/incitement.joblib"
-
-[tasks."拉踩"]
-labels = ["无", "有"]
-model_path = "models/unfair_comparison.joblib"
+model_path = "models/违规内容.joblib"
 
 [tasks."AI生成"]
 labels = ["否", "是"]
-model_path = "models/ai_generation.joblib"
+model_path = "models/AI生成.joblib"

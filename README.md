@@ -6,9 +6,11 @@ _一个可扩展的文本分类服务，基于向量嵌入 + 线性分类器，�
 
 </div>
 
+~~纯纯的氛围编程（）~~
+
 ## 功能特性
 
-- 四类默认内容审查任务（二分类）：滑坡、引战、拉踩、AI生成
+- 两类默认内容审查任务（二分类）：违规内容、AI生成
 - 动态注册自定义任务与标签
 - 支持自定义配置（Embedding 模型、设备、任务与模型路径）
 
@@ -62,7 +64,7 @@ model_path = "models/slippery_slope.joblib"
 1. 创建示例 CSV 文件
 
 ```bash
-python batch_train.py --csv sample_data.csv --create-sample
+uv run python batch_train.py --csv sample_data.csv --create-sample
 ```
 
 CSV文件格式：
@@ -76,13 +78,13 @@ CSV文件格式：
 2. 运行批量训练
 
 ```bash
-python batch_train.py --csv training_data.csv
+uv run python batch_train.py --csv training_data.csv
 ```
 
 3. 自定义参数
 
 ```bash
-python batch_train.py \
+uv run python batch_train.py \
     --csv training_data.csv \
     --url http://localhost:8000 \
     --batch-size 20 \
@@ -99,6 +101,34 @@ python batch_train.py \
 | `--timeout` | `30` | 请求超时时间（秒） |
 | `--no-auto-register` | `False` | 不自动注册新任务 |
 | `--create-sample` | `False` | 创建示例 CSV 文件 |
+
+## 评测脚本
+
+### 使用方法
+
+1. 准备评测数据，格式与训练数据相同
+
+2. 运行评测脚本
+
+  ```bash
+  uv run python eval_csv.py --csv eval_data.csv
+  ```
+
+3. 输出示例
+
+- 每个任务：样本数、准确率、各标签支持度与准确率。
+- 总体：宏观样本数与加权准确率。
+- 若开启 `--fail-under` 且总体准确率低于阈值，会以 1 退出。
+
+> 任务: 违规内容
+>   样本数: 100
+>   准确率: 0.7000
+>   分标签:
+>     - 否: acc=0.7400, support=50
+>     - 是: acc=0.6600, support=50
+> 
+> ====================
+> 总体: 样本数=100, 准确率=0.7000
 
 ## API
 

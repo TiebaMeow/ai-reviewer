@@ -35,6 +35,19 @@ class ConfigResponse(BaseModel):
     tasks: dict[str, dict[str, object]]
 
 
+class EvalRequest(BaseModel):
+    texts: list[str]
+    task: str
+    labels: list[str]
+
+
+class EvalResponse(BaseModel):
+    task: str
+    size: int
+    accuracy: float
+    per_label: dict[str, dict[str, float]]
+
+
 def create_app(config_path: str | None = None) -> FastAPI:
     cfg: AppConfig = load_config(config_path)
     embedder = EmbeddingBackend(cfg.embedding_model, cfg.device)
@@ -90,9 +103,13 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 task = registry.get(tname)
                 probs = task.clf.predict_proba(embs[[i]])[0]
                 idx = int(np.argmax(probs))
+                # Ensure label index is within persisted mapping range
+                if idx >= len(task.labels):
+                    # fallback to the last label to avoid index error; better surface warning in logs
+                    idx = min(idx, len(task.labels) - 1)
                 item_res[tname] = {
                     "label": task.labels[idx],
-                    "confidence": float(probs[idx]),
+                    "confidence": float(float(probs[idx]) if idx < len(probs) else 0.0),
                 }
             results.append(item_res)
         return {"results": results}
@@ -108,5 +125,32 @@ def create_app(config_path: str | None = None) -> FastAPI:
         y = [task.labels.index(label) for label in req.labels]
         registry.update(req.task, embs, y)
         return {"message": f"task {req.task} updated"}
+
+    @app.post("/eval", response_model=EvalResponse)
+    async def eval_task(req: EvalRequest):
+        if req.task not in registry._tasks:
+            raise HTTPException(status_code=404, detail=f"未找到任务: {req.task}")
+        task = registry.get(req.task)
+        if not req.texts or not req.labels or len(req.texts) != len(req.labels):
+            raise HTTPException(status_code=400, detail="texts/labels 数量需一致且非空")
+        if not all(lb in task.labels for lb in req.labels):
+            raise HTTPException(status_code=400, detail="labels 包含未注册的类别")
+        embs = embedder.encode(req.texts)
+        probs = task.clf.predict_proba(embs)
+        preds = np.argmax(probs, axis=1)
+        y_true = np.array([task.labels.index(lb) for lb in req.labels])
+        acc = float((preds == y_true).mean()) if len(y_true) else 0.0
+        # per-label metrics
+        per_label: dict[str, dict[str, float]] = {}
+        for i, lb in enumerate(task.labels):
+            mask = y_true == i
+            if mask.any():
+                per_label[lb] = {
+                    "support": float(mask.sum()),
+                    "accuracy": float((preds[mask] == y_true[mask]).mean()),
+                }
+            else:
+                per_label[lb] = {"support": 0.0, "accuracy": 0.0}
+        return EvalResponse(task=req.task, size=len(req.texts), accuracy=acc, per_label=per_label)
 
     return app

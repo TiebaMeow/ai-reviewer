@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,24 @@ class Evaluator:
         except Exception as e:
             print(f"❌ 服务器不可用: {e}")
             return False
+
+    def get_config(self) -> dict:
+        try:
+            r = self.session.get(f"{self.base_url}/config", timeout=self.timeout)
+            r.raise_for_status()
+            return r.json() or {}
+        except Exception:
+            return {}
+
+    def get_task_labels(self, task: str) -> list[str] | None:
+        cfg = self.get_config()
+        tasks = (cfg or {}).get("tasks") or {}
+        info = tasks.get(task)
+        if isinstance(info, dict):
+            lbs = info.get("labels")
+            if isinstance(lbs, list) and all(isinstance(x, str) for x in lbs):
+                return lbs
+        return None
 
     @staticmethod
     def load_csv(csv_path: Path) -> list[dict[str, str]]:
@@ -109,6 +128,140 @@ class Evaluator:
             print(f"❌ 评测任务 '{task}' 失败: {e}")
             return None
 
+    # ---- Calibration helpers ----
+    def get_probs(self, task: str, texts: list[str]) -> list[list[float]] | None:
+        payload = {"task": task, "texts": texts}
+        try:
+            r = self.session.post(f"{self.base_url}/probs", json=payload, timeout=self.timeout)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json() or {}
+            return data.get("probs")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _grid(spec: str) -> list[float]:
+        """Parse range spec 'start:stop:step' to a float list."""
+        try:
+            start_s, stop_s, step_s = spec.split(":")
+            start, stop, step = float(start_s), float(stop_s), float(step_s)
+            n = int(math.floor((stop - start) / step)) + 1
+            return [start + i * step for i in range(max(n, 0))]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _macro_f1(y_true: list[int], y_pred: list[int], n_classes: int) -> float:
+        try:
+            from sklearn.metrics import f1_score
+
+            return float(f1_score(y_true, y_pred, labels=list(range(n_classes)), average="macro", zero_division=0))
+        except Exception:
+            # 简易实现：按每类F1再平均（当 sklearn 不可用时退化）
+            tp = [0] * n_classes
+            fp = [0] * n_classes
+            fn = [0] * n_classes
+            for yt, yp in zip(y_true, y_pred, strict=True):
+                if yt == yp:
+                    tp[yt] += 1
+                else:
+                    fp[yp] += 1
+                    fn[yt] += 1
+            f1s = []
+            for k in range(n_classes):
+                p = tp[k] / (tp[k] + fp[k]) if (tp[k] + fp[k]) > 0 else 0.0
+                r = tp[k] / (tp[k] + fn[k]) if (tp[k] + fn[k]) > 0 else 0.0
+                f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+                f1s.append(f1)
+            return float(sum(f1s) / len(f1s)) if f1s else 0.0
+
+    @staticmethod
+    def _nll(y_true: list[int], probs: list[list[float]]) -> float:
+        eps = 1e-12
+        loss = 0.0
+        for i, yt in enumerate(y_true):
+            p = probs[i][yt] if 0 <= yt < len(probs[i]) else eps
+            p = max(p, eps)
+            loss -= math.log(p)
+        return loss / max(1, len(y_true))
+
+    @staticmethod
+    def _apply_temp_to_probs(probs: list[list[float]], temperature: float) -> list[list[float]]:
+        import numpy as np
+
+        arr = np.array(probs, dtype=float)
+        eps = 1e-12
+        logits = np.log(np.maximum(arr, eps)) / float(temperature)
+        ex = np.exp(logits - logits.max(axis=1, keepdims=True))
+        out = ex / ex.sum(axis=1, keepdims=True)
+        return out.tolist()
+
+    def calibrate_threshold(
+        self, task: str, items: list[dict[str, str]], grid: str, target: str
+    ) -> tuple[float | None, float]:
+        labels = self.get_task_labels(task) or []
+        if len(labels) != 2:
+            return None, 0.0
+        texts = [it["text"] for it in items]
+        y_true = [labels.index(it["label"]) for it in items if it["label"] in labels]
+        probs = self.get_probs(task, texts)
+        if probs is None:
+            return None, 0.0
+        pos_idx = 1  # 与服务端一致，第二个标签视为正类
+        best_thr, best_score = None, -1.0
+        for thr in self._grid(grid):
+            y_pred = [1 if (row[pos_idx] if pos_idx < len(row) else 0.0) >= thr else 0 for row in probs]
+            if target == "f1":
+                score = self._macro_f1(y_true, y_pred, 2)
+            else:  # fallback to accuracy
+                score = sum(int(a == b) for a, b in zip(y_true, y_pred, strict=True)) / max(1, len(y_true))
+            if score > best_score + 1e-12:
+                best_score, best_thr = score, float(thr)
+        return best_thr, best_score
+
+    def calibrate_temperature(
+        self, task: str, items: list[dict[str, str]], grid: str, target: str
+    ) -> tuple[float | None, float]:
+        labels = self.get_task_labels(task) or []
+        if len(labels) < 2:
+            return None, 0.0
+        texts = [it["text"] for it in items]
+        y_true = [labels.index(it["label"]) for it in items if it["label"] in labels]
+        base_probs = self.get_probs(task, texts)
+        if base_probs is None:
+            return None, 0.0
+        best_temp, best_obj = None, float("inf") if target == "nll" else -1.0
+        for t in self._grid(grid):
+            if t <= 0:
+                continue
+            probs = self._apply_temp_to_probs(base_probs, t)
+            if target == "nll":
+                obj = self._nll(y_true, probs)
+                better = obj < best_obj
+            else:
+                y_pred = [int(max(range(len(p)), key=lambda k: p[k])) for p in probs]
+                obj = self._macro_f1(y_true, y_pred, len(labels))
+                better = obj > best_obj
+            if best_temp is None or better:
+                best_temp, best_obj = float(t), obj
+        return best_temp, best_obj
+
+    def write_calibration(self, task: str, threshold: float | None, temperature: float | None) -> bool:
+        payload: dict[str, object] = {"task": task}
+        if threshold is not None:
+            payload["threshold"] = float(threshold)
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        try:
+            r = self.session.post(f"{self.base_url}/tasks/calibrate", json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"⚠️ 写回校准失败: {e}")
+            return False
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="评测 CSV 准确率（按任务分组，服务端 /eval 计算）")
@@ -116,6 +269,16 @@ def main() -> int:
     parser.add_argument("--url", type=str, default="http://localhost:8000", help="AI Reviewer 服务 URL")
     parser.add_argument("--timeout", type=int, default=30, help="请求超时时间（秒）")
     parser.add_argument("--fail-under", type=float, default=None, help="总体准确率低于该阈值则以非零码退出")
+    parser.add_argument("--auto-calibrate", action="store_true", help="自动校准：二分类阈值、多分类温度")
+    parser.add_argument(
+        "--calib-target",
+        choices=["f1", "nll"],
+        default="nll",
+        help="温度或阈值优化目标：二分类建议 f1，多分类默认 nll",
+    )
+    parser.add_argument("--th-grid", type=str, default="0.2:0.8:0.02", help="阈值搜索范围，格式 start:stop:step")
+    parser.add_argument("--temp-grid", type=str, default="0.5:2.0:0.1", help="温度搜索范围，格式 start:stop:step")
+    parser.add_argument("--no-write-back", action="store_true", help="只计算最优参数但不写回服务端")
 
     args = parser.parse_args()
 
@@ -162,6 +325,27 @@ def main() -> int:
             for lb, m in res.per_label.items():
                 print(f"    - {lb}: acc={m.get('accuracy', 0.0):.4f}, support={int(m.get('support', 0.0))}")
         print()
+
+        # 可选：自动校准
+        if args.auto_calibrate:
+            labels = ev.get_task_labels(task) or []
+            if len(labels) == 2:
+                thr, score = ev.calibrate_threshold(task, items, args.th_grid, target="f1")
+                if thr is not None:
+                    print(f"  建议阈值: {thr:.2f}（基于F1）")
+                    if not args.no_write_back:
+                        ok = ev.write_calibration(task, threshold=thr, temperature=None)
+                        print("  ↳ 阈值写回: ", "成功" if ok else "失败")
+            elif len(labels) > 2:
+                temp, obj = ev.calibrate_temperature(task, items, args.temp_grid, target=args.calib_target)
+                if temp is not None:
+                    if args.calib_target == "nll":
+                        print(f"  建议温度: {temp:.2f}（NLL={obj:.4f}）")
+                    else:
+                        print(f"  建议温度: {temp:.2f}（macroF1={obj:.4f}）")
+                    if not args.no_write_back:
+                        ok = ev.write_calibration(task, threshold=None, temperature=temp)
+                        print("  ↳ 温度写回: ", "成功" if ok else "失败")
 
     if total == 0:
         print("❌ 没有成功评测的任务")

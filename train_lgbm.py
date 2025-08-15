@@ -20,8 +20,181 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
 
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    print("⚠️ 警告: optuna 未安装，无法使用贝叶斯优化功能。可通过 'pip install optuna' 安装。")
+
 from ai_reviewer.config import AppConfig, load_config
 from ai_reviewer.embeddings import EmbeddingBackend
+
+
+def optimize_lgbm_params(
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    x_val: pd.DataFrame,
+    y_val: np.ndarray,
+    n_classes: int,
+    n_trials: int = 100,
+    random_state: int = 42,
+) -> dict:
+    """
+    使用 Optuna 进行 LightGBM 超参数优化
+    """
+    if not OPTUNA_AVAILABLE:
+        raise ImportError("Optuna 未安装，无法使用贝叶斯优化功能")
+
+    def objective(trial):
+        # 定义参数搜索空间
+        params = {
+            "objective": "binary" if n_classes == 2 else "multiclass",
+            "metric": "binary_logloss" if n_classes == 2 else "multi_logloss",
+            "boosting_type": "gbdt",
+            "seed": random_state,
+            "n_jobs": -1,
+            "verbose": -1,
+            "force_col_wise": True,
+            "use_gpu": "cuda",
+        }
+
+        if n_classes > 2:
+            params["num_class"] = n_classes
+
+        # 超参数搜索空间
+        params.update({
+            "n_estimators": trial.suggest_int("n_estimators", 100, 2000, step=100),
+            "learning_rate": trial.suggest_float("learning_rate", 0.05, 0.1, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 20, 300),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1e-3, 1.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.4, 1.0),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
+        })
+
+        # 训练模型
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            x_train,
+            y_train,
+            eval_set=[(x_val, y_val)],
+            eval_metric=params["metric"],
+            callbacks=[lgb.early_stopping(50, verbose=False)],
+        )
+
+        # 评估模型（使用 F1 作为优化目标）
+        y_pred = np.array(model.predict(x_val))
+        if n_classes == 2:
+            score = f1_score(y_val, y_pred)
+        else:
+            score = f1_score(y_val, y_pred, average="macro")
+
+        return float(score)
+
+    print(f"🔍 开始贝叶斯优化，将进行 {n_trials} 次试验...")
+
+    # 创建 Optuna 研究
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=random_state),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=20),
+    )
+
+    # 执行优化
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    print(f"✅ 优化完成！最佳 F1 分数: {study.best_value:.4f}")
+    print(f"🏆 最佳参数: {study.best_params}")
+
+    # 构建最终参数
+    best_params = {
+        "objective": "binary" if n_classes == 2 else "multiclass",
+        "metric": "binary_logloss" if n_classes == 2 else "multi_logloss",
+        "boosting_type": "gbdt",
+        "seed": random_state,
+        "n_jobs": -1,
+        "verbose": -1,
+        "force_col_wise": True,
+        "use_gpu": "cuda",
+    }
+
+    if n_classes > 2:
+        best_params["num_class"] = n_classes
+
+    best_params.update(study.best_params)
+
+    return best_params
+
+
+def get_default_params(n_samples: int, n_classes: int, random_state: int) -> dict:
+    """根据数据规模获取默认参数"""
+    base_params = {
+        "boosting_type": "gbdt",
+        "seed": random_state,
+        "n_jobs": -1,
+        "verbose": -1,
+        "force_col_wise": True,
+    }
+    if n_classes == 2:
+        base_params.update({
+            "objective": "binary",
+            "metric": "binary_logloss",
+        })
+    else:
+        base_params.update({
+            "objective": "multiclass",
+            "num_class": n_classes,
+            "metric": "multi_logloss",
+        })
+    # 根据样本量调整参数
+    if n_samples < 1000:
+        # 小数据集：防止过拟合
+        base_params.update({
+            "n_estimators": 200,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 6,
+            "min_child_samples": 10,
+            "reg_alpha": 0.2,
+            "reg_lambda": 0.2,
+            "feature_fraction": 0.9,
+            "bagging_fraction": 0.9,
+            "bagging_freq": 1,
+        })
+    elif n_samples < 10000:
+        # 中等数据集：平衡性能和效率
+        base_params.update({
+            "n_estimators": 500,
+            "learning_rate": 0.1,
+            "num_leaves": 64,
+            "max_depth": 8,
+            "min_child_samples": 20,
+            "reg_alpha": 0.1,
+            "reg_lambda": 0.1,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+        })
+    else:
+        # 大数据集：更复杂的模型
+        base_params.update({
+            "n_estimators": 1000,
+            "learning_rate": 0.1,
+            "num_leaves": 128,
+            "max_depth": 10,
+            "min_child_samples": 50,
+            "reg_alpha": 0.05,
+            "reg_lambda": 0.05,
+            "feature_fraction": 0.7,
+            "bagging_fraction": 0.7,
+            "bagging_freq": 10,
+        })
+    return base_params
 
 
 def train_lightgbm_task(
@@ -32,6 +205,8 @@ def train_lightgbm_task(
     params: dict | None = None,
     test_size: float = 0.2,
     random_state: int = 42,
+    use_bayesian_optimization: bool = False,
+    n_trials: int = 100,
 ):
     """
     为指定任务训练 LightGBM 模型。
@@ -112,72 +287,27 @@ def train_lightgbm_task(
     print("🏋️ 开始训练 LightGBM 模型...")
     n_samples = len(x_train_df)
     n_classes = len(task_config.labels)
-    base_params = {
-        "boosting_type": "gbdt",
-        "seed": random_state,
-        "n_jobs": -1,
-        "verbose": -1,
-        "force_col_wise": True,
-    }
-    if n_classes == 2:
-        base_params.update({
-            "objective": "binary",
-            "metric": "binary_logloss",
-        })
+
+    # 如果启用贝叶斯优化且有验证集
+    if use_bayesian_optimization and x_val_df is not None and y_val is not None and OPTUNA_AVAILABLE:
+        print("🔍 使用贝叶斯优化进行超参数调优...")
+        lgbm_params = optimize_lgbm_params(
+            x_train_df, y_train, x_val_df, y_val, n_classes, n_trials, random_state
+        )
+    elif use_bayesian_optimization and not OPTUNA_AVAILABLE:
+        print("⚠️ 无法使用贝叶斯优化：optuna 未安装，回退到默认参数")
+        lgbm_params = params or get_default_params(n_samples, n_classes, random_state)
+    elif use_bayesian_optimization and (x_val_df is None or y_val is None):
+        print("⚠️ 无法使用贝叶斯优化：需要验证集，回退到默认参数")
+        lgbm_params = params or get_default_params(n_samples, n_classes, random_state)
     else:
-        base_params.update({
-            "objective": "multiclass",
-            "num_class": n_classes,
-            "metric": "multi_logloss",
-        })
-    # 根据样本量调整参数
-    if n_samples < 1000:
-        # 小数据集：防止过拟合
-        base_params.update({
-            "n_estimators": 200,
-            "learning_rate": 0.05,
-            "num_leaves": 31,
-            "max_depth": 6,
-            "min_child_samples": 10,
-            "reg_alpha": 0.2,
-            "reg_lambda": 0.2,
-            "feature_fraction": 0.9,
-            "bagging_fraction": 0.9,
-            "bagging_freq": 1,
-        })
-    elif n_samples < 10000:
-        # 中等数据集：平衡性能和效率
-        base_params.update({
-            "n_estimators": 500,
-            "learning_rate": 0.1,
-            "num_leaves": 64,
-            "max_depth": 8,
-            "min_child_samples": 20,
-            "reg_alpha": 0.1,
-            "reg_lambda": 0.1,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-        })
-    else:
-        # 大数据集：更复杂的模型
-        base_params.update({
-            "n_estimators": 1000,
-            "learning_rate": 0.1,
-            "num_leaves": 128,
-            "max_depth": 10,
-            "min_child_samples": 50,
-            "reg_alpha": 0.05,
-            "reg_lambda": 0.05,
-            "feature_fraction": 0.7,
-            "bagging_fraction": 0.7,
-            "bagging_freq": 10,
-        })
-    lgbm_params = params or base_params
+        # 使用默认参数或用户提供的参数
+        lgbm_params = params or get_default_params(n_samples, n_classes, random_state)
+
     print(f"🔧 使用以下 LightGBM 参数: {lgbm_params}")
 
     model = lgb.LGBMClassifier(**lgbm_params)
-    eval_set = [(x_val_df, y_val)] if x_val_df is not None else None
+    eval_set = [(x_val_df, y_val)] if x_val_df is not None and y_val is not None else None
 
     model.fit(
         x_train_df,
@@ -239,6 +369,8 @@ def main():
     parser.add_argument("--params-file", type=str, default=None, help="包含 LightGBM 参数的 JSON 文件路径 (可选)")
     parser.add_argument("--test-size", type=float, default=0.2, help="验证集所占比例")
     parser.add_argument("--seed", type=int, default=42, help="用于数据划分和模型训练的随机种子")
+    parser.add_argument("--bayesian-optimization", action="store_true", help="启用贝叶斯优化进行超参数调优")
+    parser.add_argument("--n-trials", type=int, default=100, help="贝叶斯优化的试验次数")
 
     args = parser.parse_args()
 
@@ -261,6 +393,8 @@ def main():
         params=lgbm_params,
         test_size=args.test_size,
         random_state=args.seed,
+        use_bayesian_optimization=args.bayesian_optimization,
+        n_trials=args.n_trials,
     )
 
 

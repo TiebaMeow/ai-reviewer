@@ -14,6 +14,7 @@ dependencies = [
     "sentence-transformers>=5.1.0",
     "lightgbm>=4.6.0",
     "pandas>=2.3.1",
+    "optuna>=4.4.0",
 ]
 
 [project.optional-dependencies]

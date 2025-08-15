@@ -145,9 +145,9 @@ classifier = "linear"
 
 LightGBM 分类器仅支持离线训练。
 
-1. 准备训练数据，格式与 `batch_train.py` 所用相同
+1. 准备训练数据，格式与 `batch_train.py` 所用相同。
 
-2. 运行离线批量训练（建议关闭服务再训练，防止爆显存）
+2. 运行离线批量训练（建议关闭服务再训练，防止爆显存）。
 
     ```bash
     uv run python train_lgbm.py --csv training_data.csv
@@ -175,6 +175,26 @@ uv run python train_lgbm.py \
 | `--params-file` | 可选 | LightGBM 参数 JSON 文件路径 |
 | `--test-size` | `0.3` | 测试集比例（未引入外部验证集时生效） |
 | `--seed` | `42` | 用于数据划分和模型训练的随机种子 |
+| `--bayesian-optimization` | 可选 | 启用贝叶斯优化自动调参 |
+| `--n-trials` | `100` | 贝叶斯优化的试验次数 |
+
+#### 使用贝叶斯优化自动调参
+
+贝叶斯优化会在以下范围内搜索 `LGBMClassifier` 的最优超参数：
+
+| 参数 | 搜索范围 | 说明 |
+|------|----------|------|
+| `n_estimators` | 100-2000 (步长100) | 树的数量 |
+| `learning_rate` | 0.01-0.3 (对数分布) | 学习率 |
+| `num_leaves` | 20-300 | 叶子节点数 |
+| `max_depth` | 3-15 | 最大深度 |
+| `min_child_samples` | 5-100 | 叶子节点最小样本数 |
+| `min_child_weight` | 1e-5 - 1e-1 (对数分布) | 叶子节点最小权重和 |
+| `reg_alpha` | 1e-8 - 10.0 (对数分布) | L1 正则化系数 |
+| `reg_lambda` | 1e-8 - 10.0 (对数分布) | L2 正则化系数 |
+| `feature_fraction` | 0.4-1.0 | 特征采样比例 |
+| `bagging_fraction` | 0.4-1.0 | 样本采样比例 |
+| `bagging_freq` | 1-7 | 采样频率 |
 
 ### 评测脚本
 

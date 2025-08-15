@@ -10,6 +10,9 @@ from pathlib import Path
 class TaskConfig:
     labels: list[str]
     model_path: str
+    classifier: str = "linear"  # 'linear' or 'lightgbm'
+    threshold: float | None = None
+    temperature: float | None = None
 
 
 @dataclass

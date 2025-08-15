@@ -10,12 +10,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -73,37 +73,31 @@ class Evaluator:
         return None
 
     @staticmethod
-    def load_csv(csv_path: Path) -> list[dict[str, str]]:
+    def load_csv(csv_path: Path) -> pd.DataFrame:
         if not csv_path.exists():
             raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
-        data: list[dict[str, str]] = []
-        with csv_path.open(encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            required = {"text", "task", "label"}
-            fields = set(reader.fieldnames or [])
-            if not required.issubset(fields):
-                missing = required - fields
-                raise ValueError(f"CSV文件缺少必需列: {missing}")
-            for row_num, row in enumerate(reader, start=2):
-                text = (row.get("text") or "").strip()
-                task = (row.get("task") or "").strip()
-                label = (row.get("label") or "").strip()
-                if not text or not task or not label:
-                    print(f"⚠️  第{row_num}行无效，跳过")
-                    continue
-                data.append({"text": text, "task": task, "label": label})
-        return data
+        df = pd.read_csv(csv_path)
+        required = {"text", "task", "label"}
+        if not required.issubset(df.columns):
+            missing = required - set(df.columns)
+            raise ValueError(f"CSV文件缺少必需列: {missing}")
+        # 清理数据
+        df = df[list(required)].copy()
+        df.dropna(inplace=True)
+        for col in ["text", "task", "label"]:
+            df[col] = df[col].astype(str).str.strip()
+        df = df[df["text"].str.len() > 0]
+        df = df[df["task"].str.len() > 0]
+        df = df[df["label"].str.len() > 0]
+        return df
 
     @staticmethod
-    def group_by_task(data: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
-        groups: dict[str, list[dict[str, str]]] = {}
-        for item in data:
-            groups.setdefault(item["task"], []).append(item)
-        return groups
+    def group_by_task(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        return {str(task): group for task, group in df.groupby("task")}
 
-    def eval_task(self, task: str, items: list[dict[str, str]]) -> TaskEvalResult | None:
-        texts = [it["text"] for it in items]
-        labels = [it["label"] for it in items]
+    def eval_task(self, task: str, items_df: pd.DataFrame) -> TaskEvalResult | None:
+        texts = items_df["text"].tolist()
+        labels = items_df["label"].tolist()
         payload = {"task": task, "texts": texts, "labels": labels}
         try:
             r = self.session.post(f"{self.base_url}/eval", json=payload, timeout=self.timeout)
@@ -199,13 +193,13 @@ class Evaluator:
         return out.tolist()
 
     def calibrate_threshold(
-        self, task: str, items: list[dict[str, str]], grid: str, target: str
+        self, task: str, items_df: pd.DataFrame, grid: str, target: str
     ) -> tuple[float | None, float]:
         labels = self.get_task_labels(task) or []
         if len(labels) != 2:
             return None, 0.0
-        texts = [it["text"] for it in items]
-        y_true = [labels.index(it["label"]) for it in items if it["label"] in labels]
+        texts = items_df["text"].tolist()
+        y_true = [labels.index(label) for label in items_df["label"] if label in labels]
         probs = self.get_probs(task, texts)
         if probs is None:
             return None, 0.0
@@ -222,13 +216,13 @@ class Evaluator:
         return best_thr, best_score
 
     def calibrate_temperature(
-        self, task: str, items: list[dict[str, str]], grid: str, target: str
+        self, task: str, items_df: pd.DataFrame, grid: str, target: str
     ) -> tuple[float | None, float]:
         labels = self.get_task_labels(task) or []
         if len(labels) < 2:
             return None, 0.0
-        texts = [it["text"] for it in items]
-        y_true = [labels.index(it["label"]) for it in items if it["label"] in labels]
+        texts = items_df["text"].tolist()
+        y_true = [labels.index(label) for label in items_df["label"] if label in labels]
         base_probs = self.get_probs(task, texts)
         if base_probs is None:
             return None, 0.0
@@ -289,16 +283,16 @@ def main() -> int:
         return 2
 
     try:
-        data = ev.load_csv(csv_path)
+        df = ev.load_csv(csv_path)
     except Exception as e:
         print(f"❌ 读取CSV失败: {e}")
         return 2
 
-    if not data:
+    if df.empty:
         print("❌ CSV 中无有效数据")
         return 2
 
-    groups = ev.group_by_task(data)
+    groups = ev.group_by_task(df)
     if not groups:
         print("❌ 未找到任何任务数据")
         return 2
@@ -309,8 +303,8 @@ def main() -> int:
     total = 0
     correct = 0.0
 
-    for task, items in groups.items():
-        res = ev.eval_task(task, items)
+    for task, items_df in groups.items():
+        res = ev.eval_task(task, items_df)
         if res is None:
             continue
         results.append(res)
@@ -330,14 +324,14 @@ def main() -> int:
         if args.auto_calibrate:
             labels = ev.get_task_labels(task) or []
             if len(labels) == 2:
-                thr, score = ev.calibrate_threshold(task, items, args.th_grid, target="f1")
+                thr, score = ev.calibrate_threshold(task, items_df, args.th_grid, target="f1")
                 if thr is not None:
                     print(f"  建议阈值: {thr:.2f}（基于F1）")
                     if not args.no_write_back:
                         ok = ev.write_calibration(task, threshold=thr, temperature=None)
                         print("  ↳ 阈值写回: ", "成功" if ok else "失败")
             elif len(labels) > 2:
-                temp, obj = ev.calibrate_temperature(task, items, args.temp_grid, target=args.calib_target)
+                temp, obj = ev.calibrate_temperature(task, items_df, args.temp_grid, target=args.calib_target)
                 if temp is not None:
                     if args.calib_target == "nll":
                         print(f"  建议温度: {temp:.2f}（NLL={obj:.4f}）")

@@ -4,3 +4,4 @@ device = "auto"
 [tasks."违规内容"]
 labels = ["否", "是"]
 model_path = "models/违规内容.joblib"
+classifier = "lightgbm"

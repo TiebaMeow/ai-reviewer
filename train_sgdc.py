@@ -20,6 +20,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -140,56 +142,32 @@ class BatchTrainer:
                     print("  标签错误或数据格式不正确")
             return False
 
-    def load_csv_data(self, csv_file: Path) -> list[dict[str, str]]:
-        """从CSV文件加载训练数据"""
-        data = []
-
+    def load_csv_data(self, csv_file: Path) -> pd.DataFrame:
+        """从CSV文件加载训练数据并进行清理。"""
         if not csv_file.exists():
             raise FileNotFoundError(f"CSV文件不存在: {csv_file}")
 
-        try:
-            with csv_file.open(encoding="utf-8") as f:
-                reader = csv.DictReader(f)
+        df = pd.read_csv(csv_file)
+        required_columns = {"text", "task", "label"}
+        if not required_columns.issubset(df.columns):
+            missing = required_columns - set(df.columns)
+            raise ValueError(f"CSV文件缺少必需的列: {missing}")
 
-                # 检查必需的列
-                required_columns = {"text", "task", "label"}
-                fieldnames = reader.fieldnames or []
-                if not required_columns.issubset(fieldnames):
-                    missing = required_columns - set(fieldnames)
-                    raise ValueError(f"CSV文件缺少必需的列: {missing}")
+        # 选择并清理数据
+        df = df[list(required_columns)].copy()
+        df.dropna(inplace=True)
+        for col in ["text", "task", "label"]:
+            df[col] = df[col].astype(str).str.strip()
 
-                for row_num, row in enumerate(reader, start=2):
-                    # 验证数据
-                    if not row["text"].strip():
-                        print(f"⚠️  第{row_num}行: 文本内容为空，跳过")
-                        continue
-                    if not row["task"].strip():
-                        print(f"⚠️  第{row_num}行: 任务名称为空，跳过")
-                        continue
-                    if not row["label"].strip():
-                        print(f"⚠️  第{row_num}行: 标签为空，跳过")
-                        continue
+        df = df[df["text"].str.len() > 0]
+        df = df[df["task"].str.len() > 0]
+        df = df[df["label"].str.len() > 0]
 
-                    data.append({
-                        "text": row["text"].strip(),
-                        "task": row["task"].strip(),
-                        "label": row["label"].strip()
-                    })
+        return df
 
-        except Exception as e:
-            raise Exception(f"读取CSV文件失败: {e}") from e
-
-        return data
-
-    def group_by_task(self, data: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    def group_by_task(self, df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         """按任务分组数据"""
-        groups = {}
-        for item in data:
-            task = item["task"]
-            if task not in groups:
-                groups[task] = []
-            groups[task].append(item)
-        return groups
+        return {str(task): group_df for task, group_df in df.groupby("task")}
 
     def batch_train(
         self,
@@ -212,47 +190,42 @@ class BatchTrainer:
 
         # 加载数据
         try:
-            data = self.load_csv_data(csv_file)
+            df = self.load_csv_data(csv_file)
         except Exception as e:
             print(f"❌ {e}")
             return False
 
-        if not data:
+        if df.empty:
             print("❌ 没有有效的训练数据")
             return False
 
-        print(f"✓ 成功加载 {len(data)} 条训练数据")
+        print(f"✓ 成功加载 {len(df)} 条训练数据")
 
         # 若提供外部验证集，加载之
-        val_data: list[dict[str, str]] = []
+        val_df: pd.DataFrame | None = None
         if val_csv is not None:
             try:
                 print(f"📁 加载验证集CSV文件: {val_csv}")
-                val_data = self.load_csv_data(val_csv)
-                if not val_data:
+                val_df = self.load_csv_data(val_csv)
+                if val_df.empty:
                     print("⚠️ 验证集为空，将忽略外部验证集")
+                    val_df = None
             except Exception as e:
                 print(f"⚠️ 加载外部验证集失败（将忽略并回退到内部划分，如启用）: {e}")
-                val_data = []
+                val_df = None
 
         # 检查服务器
         if not self.check_server():
             return False
 
         # 按任务分组
-        task_groups = self.group_by_task(data)
+        task_groups = self.group_by_task(df)
         print(f"📊 发现 {len(task_groups)} 个不同的任务:")
 
-        for task_name, items in task_groups.items():
+        for task_name, items_df in task_groups.items():
             # Preserve label order by first occurrence in CSV to ensure deterministic mapping
-            seen: set[str] = set()
-            labels: list[str] = []
-            for item in items:
-                lb = item["label"]
-                if lb not in seen:
-                    seen.add(lb)
-                    labels.append(lb)
-            print(f"  - {task_name}: {len(items)} 条数据, 标签: {labels}")
+            labels = items_df["label"].unique().tolist()
+            print(f"  - {task_name}: {len(items_df)} 条数据, 标签: {labels}")
 
             # 自动注册任务
             if auto_register:
@@ -272,65 +245,58 @@ class BatchTrainer:
                     print(f"  ℹ️  服务端还有额外标签: {sorted(srv_set - csv_set)}")
 
         # 外部验证集分组（仅用于同名任务）
-        val_groups: dict[str, list[dict[str, str]]] = {}
-        if val_data:
-            val_groups = self.group_by_task(val_data)
+        val_groups: dict[str, pd.DataFrame] = {}
+        if val_df is not None:
+            val_groups = self.group_by_task(val_df)
             # 只提示一次总体信息
-            print(f"📑 外部验证集: 共 {len(val_data)} 条，涉及 {len(val_groups)} 个任务")
+            print(f"📑 外部验证集: 共 {len(val_df)} 条，涉及 {len(val_groups)} 个任务")
 
         # 定义分层打乱与交替混合（按标签分桶并轮询取样）
-        def stratified_interleave(items: list[dict[str, str]], rnd: random.Random) -> list[dict[str, str]]:
-            buckets: dict[str, list[dict[str, str]]] = {}
-            for it in items:
-                buckets.setdefault(it["label"], []).append(it)
-            # 独立打乱每个标签桶
-            for arr in buckets.values():
-                rnd.shuffle(arr)
-            order = list(buckets.keys())
-            rnd.shuffle(order)
-            mixed: list[dict[str, str]] = []
-            # 轮询取样直到所有桶耗尽（每轮使用一次性 extend）
-            while any(buckets[k] for k in order):
-                round_elems = [buckets[k].pop() for k in order if buckets[k]]
-                mixed.extend(round_elems)
-            return mixed
+        def stratified_interleave(df: pd.DataFrame, rnd: np.random.RandomState) -> pd.DataFrame:
+            # 使用 frac=1 进行随机抽样，实现打乱
+            return df.sample(frac=1, random_state=rnd).reset_index(drop=True)
 
         # 批量训练
         total_success = 0
         total_failed = 0
 
-        for task_name, items in task_groups.items():
+        for task_name, items_df in task_groups.items():
             print(f"\n🔄 开始训练任务: {task_name}")
             # 可选验证集划分（基于每个任务独立）
-            rnd_global = random.Random(seed if seed is not None else random.randrange(1 << 30))
+            rnd_global = np.random.RandomState(seed=seed if seed is not None else random.randrange(1 << 30))
             # 优先使用外部验证集
-            ext_val_items = val_groups.get(task_name, []) if val_groups else []
-            if ext_val_items:
-                train_items = list(items)
-                val_items = list(ext_val_items)
-                print(f"  使用外部验证集: {len(val_items)} 条")
+            ext_val_df = val_groups.get(task_name) if val_groups else None
+            if ext_val_df is not None:
+                train_df = items_df.copy()
+                val_items_df = ext_val_df.copy()
+                print(f"  使用外部验证集: {len(val_items_df)} 条")
             else:
                 # 回退到内部划分（仅当设置了比例且样本数足够时）
-                if 0.0 < val_ratio < 0.5 and len(items) >= 10:
-                    items_copy = list(items)
-                    rnd_global.shuffle(items_copy)
-                    split = int(len(items_copy) * (1 - val_ratio))
-                    train_items = items_copy[:split]
-                    val_items = items_copy[split:]
-                    print(f"  内部划分验证集: 训练 {len(train_items)} / 验证 {len(val_items)} (ratio={val_ratio})")
+                if 0.0 < val_ratio < 0.5 and len(items_df) >= 10:
+                    # 使用 train_test_split 进行分层划分
+                    from sklearn.model_selection import train_test_split
+                    train_df, val_items_df = train_test_split(
+                        items_df,
+                        test_size=val_ratio,
+                        random_state=rnd_global,
+                        stratify=items_df["label"],
+                    )
+                    print(f"  内部划分验证集: 训练 {len(train_df)} / 验证 {len(val_items_df)} (ratio={val_ratio})")
                 else:
-                    train_items = list(items)
-                    val_items = []
+                    train_df = items_df.copy()
+                    val_items_df = pd.DataFrame()
 
             # 若能获取服务端标签，过滤掉未知标签样本，减少 400 错误
             server_labels = self._get_task_labels_from_server(task_name)
             if server_labels:
-                before_train = len(train_items)
-                before_val = len(val_items)
-                train_items = [it for it in train_items if it["label"] in server_labels]
-                val_items = [it for it in val_items if it["label"] in server_labels]
-                removed_train = before_train - len(train_items)
-                removed_val = before_val - len(val_items)
+                before_train = len(train_df)
+                before_val = len(val_items_df)
+                train_df = train_df[train_df["label"].isin(server_labels)]
+                if not val_items_df.empty:
+                    val_items_df = val_items_df[val_items_df["label"].isin(server_labels)]
+
+                removed_train = before_train - len(train_df)
+                removed_val = before_val - len(val_items_df)
                 if removed_train or removed_val:
                     print(
                         f"  ⚠️ 过滤未知标签样本: 训练 -{removed_train} / 验证 -{removed_val} "
@@ -338,17 +304,19 @@ class BatchTrainer:
                     )
 
             # 打印标签分布
-            def label_dist(arr: list[dict[str, str]]) -> str:
+            def label_dist_df(df: pd.DataFrame) -> str:
                 from collections import Counter
                 from operator import itemgetter
 
-                c = Counter(x["label"] for x in arr)
+                if df.empty:
+                    return "(空)"
+                c = Counter(df["label"])
                 parts = [f"{k}:{v}" for k, v in sorted(c.items(), key=itemgetter(0))]
-                return ", ".join(parts) if parts else "(空)"
+                return ", ".join(parts)
 
-            print(f"  训练标签分布: {label_dist(train_items)}")
-            if val_items:
-                print(f"  验证标签分布: {label_dist(val_items)}")
+            print(f"  训练标签分布: {label_dist_df(train_df)}")
+            if not val_items_df.empty:
+                print(f"  验证标签分布: {label_dist_df(val_items_df)}")
 
             best_val_acc = -1.0
             not_improve_epochs = 0
@@ -356,28 +324,30 @@ class BatchTrainer:
             last_val_acc = None
             # 进行多个 epoch 的分层打乱并分批提交
             for ep in range(epochs):
-                rnd = random.Random((seed if seed is not None else random.randrange(1 << 30)) + ep)
-                items_epoch = stratified_interleave(train_items, rnd) if shuffle else list(train_items)
+                rnd = np.random.RandomState(seed=seed + ep if seed is not None else random.randrange(1 << 30))
+
+                items_epoch_df = stratified_interleave(train_df, rnd) if shuffle else train_df.copy()
+
                 t0 = time.time()
                 processed = 0
 
-                for i in range(0, len(items_epoch), batch_size):
-                    batch = items_epoch[i:i + batch_size]
-                    texts = [item["text"] for item in batch]
-                    labels = [item["label"] for item in batch]
+                for i in range(0, len(items_epoch_df), batch_size):
+                    batch_df = items_epoch_df.iloc[i:i + batch_size]
+                    texts = batch_df["text"].tolist()
+                    labels = batch_df["label"].tolist()
 
                     print(
-                        f"  Epoch {ep + 1}/{epochs} 批次 {i // batch_size + 1}: 处理 {len(batch)} 条数据...",
+                        f"  Epoch {ep + 1}/{epochs} 批次 {i // batch_size + 1}: 处理 {len(batch_df)} 条数据...",
                         end="",
                     )
 
                     if self.update_task(texts, task_name, labels):
                         print(" ✓")
-                        total_success += len(batch)
-                        processed += len(batch)
+                        total_success += len(batch_df)
+                        processed += len(batch_df)
                     else:
                         print(" ❌")
-                        total_failed += len(batch)
+                        total_failed += len(batch_df)
 
                     # 延迟避免过于频繁的请求
                     if delay > 0:
@@ -386,9 +356,9 @@ class BatchTrainer:
                 # 简单在线评估：调用 /eval 计算训练集与验证集准确率
                 try:
                     # 训练集快速抽样评估，避免过长
-                    sample_train = train_items if len(train_items) <= 200 else rnd.sample(train_items, 200)
-                    train_texts = [it["text"] for it in sample_train]
-                    train_labels = [it["label"] for it in sample_train]
+                    sample_train_df = train_df.sample(n=min(len(train_df), 200), random_state=rnd)
+                    train_texts = sample_train_df["text"].tolist()
+                    train_labels = sample_train_df["label"].tolist()
                     ev_payload = {"task": task_name, "texts": train_texts, "labels": train_labels}
                     r = self.session.post(f"{self.base_url}/eval", json=ev_payload, timeout=self.timeout)
                     r.raise_for_status()
@@ -400,11 +370,11 @@ class BatchTrainer:
                     train_macro_f1 = None
 
                 val_acc = None
-                if val_items:
+                if not val_items_df.empty:
                     try:
-                        sample_val = val_items if len(val_items) <= 200 else rnd.sample(val_items, 200)
-                        val_texts = [it["text"] for it in sample_val]
-                        val_labels = [it["label"] for it in sample_val]
+                        sample_val_df = val_items_df.sample(n=min(len(val_items_df), 200), random_state=rnd)
+                        val_texts = sample_val_df["text"].tolist()
+                        val_labels = sample_val_df["label"].tolist()
                         ev_payload = {"task": task_name, "texts": val_texts, "labels": val_labels}
                         r = self.session.post(f"{self.base_url}/eval", json=ev_payload, timeout=self.timeout)
                         r.raise_for_status()

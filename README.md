@@ -2,7 +2,7 @@
 
 # AI Reviewer
 
-_一个可扩展的文本分类服务，基于向量嵌入 + 线性分类器，支持多任务检测与在线增量学习。_
+_一个可扩展的文本分类服务，基于 SentenceTransformer 模型 + SGDClassifier/LightGBM 分类器，支持多任务检测与在线增量学习。_
 
 </div>
 
@@ -10,11 +10,11 @@ _一个可扩展的文本分类服务，基于向量嵌入 + 线性分类器，�
 
 ## 功能特性
 
-- 默认内容审查任务（二分类）：违规内容
+- 支持 SGDClassifier 和 LightGBM 分类器
 - 动态注册自定义任务与标签，在线增量学习（/update）
 - 文本预处理与向量池化（支持自定义模型、批大小、是否启用预处理）
 - 二分类支持阈值（threshold），多分类支持温度缩放（temperature）
-- 评测增强：macro 指标与困难样本（hardest）输出；支持困难样本回流训练
+- 评测支持 macro 指标与困难样本（hardest）输出；支持困难样本回流训练
 - 简易自动校准：阈值/温度一键搜索并写回
 
 ## 项目结构
@@ -45,12 +45,25 @@ _一个可扩展的文本分类服务，基于向量嵌入 + 线性分类器，�
 
     以启用 GPU 支持
 
-2. 运行服务
+2. 配置任务
+
+   在 `config.toml` 中添加任务配置，例如：
+
+   ```toml
+   [tasks."违规内容"]
+   labels = ["否", "是"]
+   model_path = "models/违规内容.joblib"
+   classifier = "linear"
+   ```
+
+   如果你指定了 `classifier = "lightgbm"`，请先运行[离线训练脚本](#lightgbm批量训练脚本train_lgbmpy)
+
+3. 运行服务
 
     ```bash
     uv run python main.py
     # 或
-    uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    uv run uvicorn main:app --host 0.0.0.0 --port 8000
     ```
 
 可使用环境变量 `AI_REVIEWER_CONFIG` 指定自定义 TOML 配置文件路径。
@@ -60,8 +73,8 @@ _一个可扩展的文本分类服务，基于向量嵌入 + 线性分类器，�
 ```toml
 embedding_model = "richinfoai/ritrieve_zh_v1"  # 可替换为其他中文句向量模型
 device = "auto"
-embed_batch_size = 32         # 可选：向量batch_size
-preprocess = true             # 可选：是否启用文本预处理
+embed_batch_size = 32     # 可选：向量batch_size
+preprocess = true         # 可选：是否启用文本预处理
 
 # 中文任务名请使用双引号
 [tasks."违规内容"]
@@ -69,45 +82,49 @@ preprocess = true             # 可选：是否启用文本预处理
 labels = ["否", "是"]
 # 任务分类器权重文件路径
 model_path = "models/违规内容.joblib"
+# 分类器："linear" 或 "lightgbm"，对应 SGDClassifier/LightGBM 分类器
+# SGDClassifier 支持在线学习
+# LightGBM 不支持在线学习，但效果更好
+classifier = "linear"
 
 ```
 
-## 批量训练脚本
+## 批量训练与评测脚本使用方法
 
-### 使用方法
+### SGDClassifier批量训练脚本（train_sgdc.py）
 
 1. 创建示例 CSV 文件
 
-```bash
-uv run python batch_train.py --csv sample_data.csv --create-sample
-```
+    ```bash
+    uv run python train_sgdc.py --csv sample_data.csv --create-sample
+    ```
 
-CSV文件格式：
+    CSV文件格式：
 
-| 列 | 说明 | 示例 |
-|-----|------|------|
-| text | 要分类的文本内容 | "难道说？" |
-| task | 分类任务名称 | "违规内容" |
-| label | 对应的标签 | "否" |
+    | 列 | 说明 | 示例 |
+    |-----|------|------|
+    | text | 要分类的文本内容 | "难道说？" |
+    | task | 分类任务名称 | "违规内容" |
+    | label | 对应的标签 | "否" |
 
 2. 运行批量训练
 
-```bash
-uv run python batch_train.py --csv training_data.csv
-```
+    ```bash
+    uv run python train_sgdc.py --csv training_data.csv
+    ```
 
 3. 常用参数
 
-```bash
-uv run python batch_train.py \
-    --csv training_data.csv \
-    --url http://localhost:8000 \
-    --batch-size 50 \
-    --val-csv eval_data.csv \
-    --val-ratio 0.2 \
-    --epochs 3 \
-    --hard-mining --hard-weight 0.3
-```
+    ```bash
+    uv run python train_sgdc.py \
+        --csv training_data.csv \
+        --url http://localhost:8000 \
+        --batch-size 50 \
+        --val-csv eval_data.csv \
+        --val-ratio 0.2 \
+        --epochs 3 \
+        --hard-mining --hard-weight 0.3
+    ```
 
 | 参数 | 默认值 | 说明 |
 |-----|--------|------|
@@ -124,28 +141,64 @@ uv run python batch_train.py \
 | `--no-hard-mining` | `False` | 关闭困难样本回流 |
 | `--hard-weight` | `0.3` | 回流样本权重 |
 
-## 评测脚本
+### LightGBM批量训练脚本（train_lgbm.py）
 
-### 使用方法
+LightGBM 分类器仅支持离线训练。
+
+1. 准备训练数据，格式与 `batch_train.py` 所用相同
+
+2. 运行离线批量训练（建议关闭服务再训练，防止爆显存）
+
+    ```bash
+    uv run python train_lgbm.py --csv training_data.csv
+    ```
+
+3. 常用参数
+
+```bash
+uv run python train_lgbm.py \
+    --csv training_data.csv \
+    --val-csv eval_data.csv \
+    --task 违规内容 \
+    --config config.toml \
+    --params-file params.json \
+    --test-size 0.3 \
+    --seed 42
+```
+
+| 参数 | 默认值 | 说明 |
+|-----|--------|------|
+| `--csv` | 必需 | CSV 训练数据文件路径 |
+| `--val-csv` | 可选 | 外部验证集 CSV |
+| `--task` | 必需 | 要训练的任务名称 (必须在 config.toml 中定义) |
+| `--config` | `config.toml` | 配置文件路径 |
+| `--params-file` | 可选 | LightGBM 参数 JSON 文件路径 |
+| `--test-size` | `0.3` | 测试集比例（未引入外部验证集时生效） |
+| `--seed` | `42` | 用于数据划分和模型训练的随机种子 |
+
+### 评测脚本
 
 1. 准备评测数据，格式与训练数据相同
 
 2. 运行评测脚本
 
-  ```bash
-  uv run python eval_csv.py --csv eval_data.csv
-  ```
+    ```bash
+    uv run python eval_csv.py --csv eval_data.csv
+    ```
 
-3. 自动校准（可选）
+3. 自动校准（可选，仅对 SGDClassifier 有效）
 
-  - 二分类阈值（F1 目标）
-  ```bash
-  uv run python eval_csv.py --csv eval_data.csv --auto-calibrate --calib-target f1
-  ```
-  - 多分类温度（NLL 目标）
-  ```bash
-  uv run python eval_csv.py --csv eval_data.csv --auto-calibrate --temp-grid 0.5:2.0:0.1
-  ```
+    - 二分类阈值（F1 目标）
+
+    ```bash
+    uv run python eval_csv.py --csv eval_data.csv --auto-calibrate --calib-target f1
+    ```
+
+   - 多分类温度（NLL 目标）
+
+    ```bash
+    uv run python eval_csv.py --csv eval_data.csv --auto-calibrate --temp-grid 0.5:2.0:0.1
+    ```
 
 4. 输出示例
 
@@ -153,15 +206,29 @@ uv run python batch_train.py \
 - 总体：宏观样本数与加权准确率。
 - 若开启 `--fail-under` 且总体准确率低于阈值，会以 1 退出。
 
-> 任务: 违规内容
->   样本数: 100
->   准确率: 0.7000
->   分标签:
->     - 否: acc=0.7400, support=50
->     - 是: acc=0.6600, support=50
-> 
-> ====================
-> 总体: 样本数=100, 准确率=0.7000
+```text
+任务: 违规内容
+  样本数: 1000
+  准确率: 0.8690
+  分标签:
+    - 否: acc=0.8220, support=500
+    - 是: acc=0.9160, support=500
+
+====================
+总体: 样本数=1000, 准确率=0.8690
+```
+
+## 注意事项
+
+### SGDClassifier
+
+- 首次注册任务时，会用任务名+标签的模板文本进行最小化冷启动，以便分类器具备类别先验。需要使用真实样本调用 `/update` 强化训练后，才能实现实际的分类效果。
+- 完成基础训练后，使用评测脚本 `--auto-calibrate` 进行阈值/温度校准，再根据 hardest 做少量困难样本回流，可获得更稳的提升。
+
+### LightGBM
+
+- LightGBM 分类器仅支持离线训练，建议训练完成后再启动服务。
+- 如果你熟悉 LightGBM 的调参优化，可以尝试创建参数文件 `params.json` 手动指定参数进行训练。
 
 ## API
 
@@ -277,7 +344,7 @@ uv run python batch_train.py \
 
 ### `POST /update`
 
-增量学习更新指定任务
+增量学习更新指定任务（仅支持 SGDClassifier）
 
 **请求示例：**
 
@@ -308,8 +375,3 @@ uv run python batch_train.py \
 ### `POST /tasks/calibrate`
 
 写回任务的 `threshold` 与 `temperature`（可二选一）。
-
-## 注意事项
-
-- 首次注册任务时，会用任务名+标签的模板文本进行最小化冷启动，以便分类器具备类别先验。需要使用真实样本调用 `/update` 强化训练后，才能实现实际的分类效果。
-- 完成基础训练后，使用评测脚本 `--auto-calibrate` 进行阈值/温度校准，再根据 hardest 做少量困难样本回流，可获得更稳的提升。

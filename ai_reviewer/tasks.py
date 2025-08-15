@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import joblib
+import lightgbm as lgb
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import SGDClassifier
 
 
@@ -14,7 +17,8 @@ class Task:
     name: str
     labels: list[str]
     model_path: str
-    clf: SGDClassifier
+    classifier_type: str
+    clf: Any  # SGDClassifier or lgb.LGBMClassifier
     threshold: float | None = None
     temperature: float | None = None
 
@@ -29,7 +33,16 @@ class TaskRegistry:
     def list(self) -> list[str]:
         return list(self._tasks.keys())
 
-    def ensure(self, name: str, labels: list[str], model_path: str, embedder_encode) -> Task:
+    def ensure(
+        self,
+        name: str,
+        labels: list[str],
+        model_path: str,
+        classifier_type: str,
+        embedder_encode,
+        threshold: float | None,
+        temperature: float | None,
+    ) -> Task:
         """
         Ensure a task exists. If a model already exists on disk, prefer the persisted
         label mapping to avoid index-order mismatches. Otherwise, create a new model,
@@ -39,10 +52,11 @@ class TaskRegistry:
         model_path_p.parent.mkdir(parents=True, exist_ok=True)
         meta_path = model_path_p.with_suffix(model_path_p.suffix + ".labels.json")
 
-        threshold: float | None = None
-        temperature: float | None = None
+        persisted_threshold: float | None = None
+        persisted_temperature: float | None = None
+
         if model_path_p.exists():
-            clf: SGDClassifier = joblib.load(model_path)
+            clf: Any = joblib.load(model_path)
             # Load persisted labels if available; this guarantees stable mapping across restarts
             if meta_path.exists():
                 try:
@@ -54,10 +68,10 @@ class TaskRegistry:
                         labels = persisted_labels
                     thr = persisted.get("threshold")
                     if isinstance(thr, (int, float)):
-                        threshold = float(thr)
+                        persisted_threshold = float(thr)
                     temp = persisted.get("temperature")
                     if isinstance(temp, (int, float)):
-                        temperature = float(temp)
+                        persisted_temperature = float(temp)
                 except Exception:
                     # Ignore meta read errors; fall back to provided labels
                     pass
@@ -72,29 +86,39 @@ class TaskRegistry:
                 except Exception:
                     pass
         else:
-            # Fresh model: initialize with stable class indices 0..K-1
-            # Tuned for more stable online learning
-            clf = SGDClassifier(
-                loss="log_loss",
-                penalty="l2",
-                alpha=1e-4,
-                random_state=42,
-                average=True,
-            )
+            # Fresh model
+            if classifier_type == "lightgbm":
+                print(f"✨ Initializing new LightGBM model for task '{name}'")
+                clf = lgb.LGBMClassifier(random_state=42)
+            else:  # default to linear
+                print(f"✨ Initializing new Linear model for task '{name}'")
+                clf = SGDClassifier(
+                    loss="log_loss",
+                    penalty="l2",
+                    alpha=1e-4,
+                    random_state=42,
+                    average=True,
+                )
+
+            # Cold start with template texts to establish classes
             templates = [f"{name}-{label}" for label in labels]
             x_init = embedder_encode(templates)
             y_init = list(range(len(labels)))
-            clf.partial_fit(x_init, y_init, classes=np.arange(len(labels)))
+
+            if hasattr(clf, "partial_fit"):
+                clf.partial_fit(x_init, y_init, classes=np.arange(len(labels)))
+            else:
+                clf.fit(x_init, y_init)
+
             joblib.dump(clf, model_path)
             # Persist label order for this model
             try:
-                # also persist a default threshold for binary tasks (0.5), can be updated later
                 meta: dict[str, object] = {"labels": labels}
                 if len(labels) == 2:
-                    threshold = 0.5
-                    meta["threshold"] = threshold
-                temperature = 1.0
-                meta["temperature"] = temperature
+                    persisted_threshold = 0.5
+                    meta["threshold"] = persisted_threshold
+                persisted_temperature = 1.0
+                meta["temperature"] = persisted_temperature
                 meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
                 pass
@@ -103,28 +127,67 @@ class TaskRegistry:
             name=name,
             labels=labels,
             model_path=model_path,
+            classifier_type=classifier_type,
             clf=clf,
-            threshold=threshold,
-            temperature=temperature,
+            threshold=threshold if threshold is not None else persisted_threshold,
+            temperature=temperature if temperature is not None else persisted_temperature,
         )
         self._tasks[name] = task
         return task
 
-    def update(self, name: str, x, y, sample_weight=None):
-        task = self._tasks[name]
-        if sample_weight is not None:
-            task.clf.partial_fit(x, y, sample_weight=sample_weight)
-        else:
+    def update(self, name: str, x: np.ndarray, y: list[int]) -> None:
+        task = self.get(name)
+        if task.classifier_type != "linear":
+            print(
+                f"⚠️ WARNING: Online learning (/update) is only supported for 'linear' models. "
+                f"Task '{name}' is '{task.classifier_type}'. Ignoring update."
+            )
+            return
+
+        if hasattr(task.clf, "partial_fit"):
             task.clf.partial_fit(x, y)
-        joblib.dump(task.clf, task.model_path)
-        # also ensure labels meta persists (in case of initial missing meta)
-        meta_path = Path(task.model_path).with_suffix(Path(task.model_path).suffix + ".labels.json")
-        if not meta_path.exists():
-            try:
-                meta: dict[str, object] = {"labels": task.labels}
-                if len(task.labels) == 2:
-                    meta["threshold"] = task.threshold if task.threshold is not None else 0.5
-                meta["temperature"] = task.temperature if task.temperature is not None else 1.0
-                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            joblib.dump(task.clf, task.model_path)
+        else:
+            print(f"⚠️ WARNING: Classifier for task '{name}' does not support partial_fit. Online learning is disabled.")
+
+    def _prepare_input_for_model(self, task: Task, x: np.ndarray) -> pd.DataFrame | np.ndarray:
+        """如果模型是 lightgbm，则将输入转换为带特征名的 DataFrame。"""
+        if task.classifier_type == "lightgbm" and hasattr(task.clf, "n_features_in_"):
+            feature_names = [f"emb_{i}" for i in range(task.clf.n_features_in_)]
+            return pd.DataFrame(x, columns=feature_names)
+        return x
+
+    def predict(self, name: str, x: np.ndarray) -> list[dict[str, float]]:
+        task = self.get(name)
+        model_input = self._prepare_input_for_model(task, x)
+        proba = task.clf.predict_proba(model_input)
+
+        if task.temperature is not None:
+            # Apply temperature scaling to logits before softmax
+            # Note: This is a simplified application. For correctness, it should
+            # be applied to logits, but predict_proba gives probabilities.
+            # We'll adjust the probabilities directly for this implementation.
+            scaled_logits = np.log(proba + 1e-9) / task.temperature
+            proba = np.exp(scaled_logits) / np.sum(np.exp(scaled_logits), axis=1, keepdims=True)
+
+        if task.threshold is not None and len(task.labels) == 2:
+            # Binary classification with threshold
+            scores = proba[:, 1]
+            predictions = (scores >= task.threshold).astype(int)
+            return [{"label": task.labels[p], "score": s} for p, s in zip(predictions, scores, strict=True)]
+        else:
+            # Multiclass classification
+            return [dict(zip(task.labels, probs, strict=True)) for probs in proba]
+
+    def get_probs(self, name: str, x: np.ndarray) -> np.ndarray:
+        """获取给定输入的原始概率分布。"""
+        task = self.get(name)
+        model_input = self._prepare_input_for_model(task, x)
+        proba = task.clf.predict_proba(model_input)
+
+        if task.temperature is not None:
+            # 应用温度缩放。这通常应用于 logits，但我们在这里近似处理概率。
+            scaled_logits = np.log(proba + 1e-9) / task.temperature
+            proba = np.exp(scaled_logits) / np.sum(np.exp(scaled_logits), axis=1, keepdims=True)
+
+        return proba

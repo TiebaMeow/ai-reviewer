@@ -4,10 +4,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from .config import AppConfig, TaskConfig, load_config
+from .config import AppConfig, load_config
 from .embeddings import EmbeddingBackend
 from .tasks import TaskRegistry
 
@@ -84,7 +85,15 @@ def create_app(config_path: str | None = None) -> FastAPI:
     registry = TaskRegistry()
 
     for name, tcfg in cfg.tasks.items():
-        registry.ensure(name=name, labels=tcfg.labels, model_path=tcfg.model_path, embedder_encode=embedder.encode)
+        registry.ensure(
+            name=name,
+            labels=tcfg.labels,
+            model_path=tcfg.model_path,
+            classifier_type=getattr(tcfg, "classifier", "linear"),
+            embedder_encode=embedder.encode,
+            threshold=getattr(tcfg, "threshold", None),
+            temperature=getattr(tcfg, "temperature", None),
+        )
 
     app = FastAPI()
 
@@ -97,6 +106,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 name: {
                     "labels": task.labels,
                     "model_path": task.model_path,
+                    "classifier": task.classifier_type,
                     "threshold": task.threshold,
                     "temperature": task.temperature,
                 }
@@ -110,18 +120,27 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.post("/tasks/register")
     async def register_task(req: RegisterTaskRequest):
-        name = req.name
-        labels = req.labels
-        if len(labels) < 2:
-            raise HTTPException(status_code=400, detail="labels 至少包含两个类别")
-        model_path = (
-            req.model_path
-            or cfg.tasks.get(name, TaskConfig(labels=labels, model_path=f"models/{name}.joblib")).model_path
-        )
-        task = registry.ensure(name=name, labels=labels, model_path=model_path, embedder_encode=embedder.encode)
-        # also persist in memory config (not writing file for simplicity)
-        cfg.tasks[name] = TaskConfig(labels=labels, model_path=task.model_path)
-        return {"message": "task registered", "task": {"name": name, "labels": labels, "model_path": model_path}}
+        if req.name in registry.list():
+            raise HTTPException(status_code=409, detail=f"Task '{req.name}' already exists")
+
+        model_path = req.model_path or str(Path("models") / f"{req.name}.joblib")
+        # Default to linear for new tasks, can be changed in config.toml
+        classifier_type = "linear"
+
+        try:
+            registry.ensure(
+                name=req.name,
+                labels=req.labels,
+                model_path=model_path,
+                classifier_type=classifier_type,
+                embedder_encode=embedder.encode,
+                threshold=None,
+                temperature=None,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to register task: {e}") from e
+
+        return {"message": "task registered", "name": req.name, "model_path": model_path}
 
     @app.post("/predict")
     async def predict(req: PredictRequest):
@@ -168,19 +187,32 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.post("/update")
     async def update(req: UpdateRequest):
-        if req.task not in registry._tasks:
-            raise HTTPException(status_code=404, detail=f"未找到任务: {req.task}")
+        if req.task not in registry.list():
+            raise HTTPException(status_code=404, detail=f"Task '{req.task}' not found")
+
         task = registry.get(req.task)
-        if not all(label in task.labels for label in req.labels):
-            raise HTTPException(status_code=400, detail="labels 包含未注册的类别")
+        if task.classifier_type != "linear":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Online learning (/update) is only supported for 'linear' models. "
+                       f"Task '{req.task}' is '{task.classifier_type}'.",
+            )
+
+        if len(req.texts) != len(req.labels):
+            raise HTTPException(status_code=400, detail="Number of texts and labels must be equal")
+
+        try:
+            y = [task.labels.index(label) for label in req.labels]
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid label found: {e}") from e
+
         embs = embedder.encode(req.texts)
-        y = [task.labels.index(label) for label in req.labels]
-        weights = None
-        if req.sample_weight is not None:
-            if len(req.sample_weight) != len(req.texts):
-                raise HTTPException(status_code=400, detail="sample_weight 长度需与 texts 相同")
-            weights = req.sample_weight
-        registry.update(req.task, embs, y, sample_weight=weights)
+
+        # sample_weight is not used for linear model's partial_fit
+        # if req.sample_weight:
+        #     weights = req.sample_weight
+        registry.update(req.task, embs, y)
+
         return {"message": f"task {req.task} updated"}
 
     @app.post("/eval", response_model=EvalResponse)
@@ -193,7 +225,17 @@ def create_app(config_path: str | None = None) -> FastAPI:
         if not all(lb in task.labels for lb in req.labels):
             raise HTTPException(status_code=400, detail="labels 包含未注册的类别")
         embs = embedder.encode(req.texts)
-        probs = task.clf.predict_proba(embs)
+
+        # Convert embeddings to DataFrame with feature names for LightGBM compatibility
+
+        if hasattr(task.clf, "feature_name_") and task.clf.feature_name_:
+            # Use existing feature names from the model
+            feature_names = [f"feature_{i}" for i in range(embs.shape[1])]
+            embs_df = pd.DataFrame(embs, columns=feature_names)
+            probs = task.clf.predict_proba(embs_df)
+        else:
+            probs = task.clf.predict_proba(embs)
+
         # apply temperature for evaluation consistency if set
         if task.temperature is not None and task.temperature > 0:
             eps = 1e-12

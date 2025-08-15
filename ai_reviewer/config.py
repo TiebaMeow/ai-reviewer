@@ -14,8 +14,11 @@ class TaskConfig:
 
 @dataclass
 class AppConfig:
+    # You can change to stronger Chinese embedding models, e.g., "BAAI/bge-large-zh-v1.5"
     embedding_model: str = "richinfoai/ritrieve_zh_v1"
     device: str = "auto"
+    embed_batch_size: int = 32
+    preprocess: bool = True
     tasks: dict[str, TaskConfig] = field(default_factory=dict)
 
     @staticmethod
@@ -24,6 +27,8 @@ class AppConfig:
         return AppConfig(
             embedding_model=data.get("embedding_model") or "richinfoai/ritrieve_zh_v1",
             device=data.get("device") or "auto",
+            embed_batch_size=int(data.get("embed_batch_size", 32)),
+            preprocess=bool(data.get("preprocess", True)),
             tasks=tasks_cfg,
         )
 

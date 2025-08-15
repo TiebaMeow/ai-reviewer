@@ -2,9 +2,5 @@ embedding_model = "richinfoai/ritrieve_zh_v1"
 device = "auto"
 
 [tasks."违规内容"]
-labels = ["无", "有"]
-model_path = "models/违规内容.joblib"
-
-[tasks."AI生成"]
 labels = ["否", "是"]
-model_path = "models/AI生成.joblib"
+model_path = "models/违规内容.joblib"

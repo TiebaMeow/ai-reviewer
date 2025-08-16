@@ -9,8 +9,8 @@ CSV文件格式：
 - label: 标签
 
 使用示例：
-    python batch_train.py --csv data/training_data.csv --url http://localhost:8000
-    python batch_train.py --csv data/training_data.csv --batch-size 10 --delay 0.5
+    python train_sgdc.py --csv data/training_data.csv --url http://localhost:8000
+    python train_sgdc.py --csv data/training_data.csv --batch-size 10 --delay 0.5
 """
 
 import argparse

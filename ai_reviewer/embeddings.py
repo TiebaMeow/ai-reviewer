@@ -64,7 +64,7 @@ class EmbeddingBackend:
         - Lowercase ASCII letters
         """
         url_re = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-        at_re = re.compile(r"@\S+")
+        # at_re = re.compile(r"@\S+")
         punct_re = re.compile(r"([!?。！，,．.、~…])\1{1,}")
         repeat_char_re = re.compile(r"(.)\1{2,}")
         ws_re = re.compile(r"\s+")
@@ -74,7 +74,7 @@ class EmbeddingBackend:
             s = t if isinstance(t, str) else str(t)
             s = unicodedata.normalize("NFKC", s)
             s = url_re.sub(" ", s)
-            s = at_re.sub(" ", s)
+            # s = at_re.sub(" ", s)
             s = punct_re.sub(r"\1\1", s)  # limit long punctuation runs to 2
             s = repeat_char_re.sub(r"\1\1", s)  # limit long repeated chars to 2
             s = ws_re.sub(" ", s).strip()

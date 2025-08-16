@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -150,13 +149,14 @@ def create_app(config_path: str | None = None) -> FastAPI:
         missing = [t for t in target_tasks if t not in registry._tasks]
         if missing:
             raise HTTPException(status_code=404, detail=f"未找到任务: {missing}")
-        embs = embedder.encode(req.texts)
         results = []
         for i in range(len(req.texts)):
             item_res = {}
             for tname in target_tasks:
                 task = registry.get(tname)
-                probs = task.clf.predict_proba(embs[[i]])[0]
+                # build combined features per task (embeddings + tfidf) and get probabilities
+                probs_all = registry.get_probs_texts(tname, [req.texts[i]])
+                probs = probs_all[0]
                 idx = int(np.argmax(probs))
                 # Ensure label index is within persisted mapping range
                 if idx >= len(task.labels):
@@ -168,8 +168,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     # convert probabilities back to logits via log, then resoftmax with temperature
                     # add small eps to avoid log(0)
                     eps = 1e-12
-                    logits = np.log(np.maximum(probs, eps))
-                    logits = logits / float(task.temperature)
+                    logits = np.log(np.maximum(probs, eps)) / float(task.temperature)
                     expv = np.exp(logits - np.max(logits))
                     probs = expv / np.sum(expv)
                     idx = int(np.argmax(probs))
@@ -195,7 +194,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=400,
                 detail=f"Online learning (/update) is only supported for 'linear' models. "
-                       f"Task '{req.task}' is '{task.classifier_type}'.",
+                f"Task '{req.task}' is '{task.classifier_type}'.",
             )
 
         if len(req.texts) != len(req.labels):
@@ -224,17 +223,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="texts/labels 数量需一致且非空")
         if not all(lb in task.labels for lb in req.labels):
             raise HTTPException(status_code=400, detail="labels 包含未注册的类别")
-        embs = embedder.encode(req.texts)
-
-        # Convert embeddings to DataFrame with feature names for LightGBM compatibility
-
-        if hasattr(task.clf, "feature_name_") and task.clf.feature_name_:
-            # Use existing feature names from the model
-            feature_names = [f"feature_{i}" for i in range(embs.shape[1])]
-            embs_df = pd.DataFrame(embs, columns=feature_names)
-            probs = task.clf.predict_proba(embs_df)
-        else:
-            probs = task.clf.predict_proba(embs)
+        probs = registry.get_probs_texts(req.task, req.texts)
 
         # apply temperature for evaluation consistency if set
         if task.temperature is not None and task.temperature > 0:
@@ -276,15 +265,13 @@ def create_app(config_path: str | None = None) -> FastAPI:
             for i in range(len(req.texts)):
                 wrong = int(preds[i] != y_true[i])
                 if wrong or margin[i] < 0.1:
-                    hardest.append(
-                        {
-                            "text": req.texts[i],
-                            "true": task.labels[y_true[i]],
-                            "pred": task.labels[preds[i]],
-                            "conf": float(probs[i, preds[i]]),
-                            "margin": float(margin[i]),
-                        }
-                    )
+                    hardest.append({
+                        "text": req.texts[i],
+                        "true": task.labels[y_true[i]],
+                        "pred": task.labels[preds[i]],
+                        "conf": float(probs[i, preds[i]]),
+                        "margin": float(margin[i]),
+                    })
             hardest = sorted(hardest, key=lambda d: (d.get("pred") == d.get("true"), d.get("margin", 0.0)))[:100]
         except Exception:
             hardest = []
@@ -306,8 +293,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         task = registry.get(req.task)
         if not req.texts:
             raise HTTPException(status_code=400, detail="texts 不能为空")
-        embs = embedder.encode(req.texts)
-        probs = task.clf.predict_proba(embs)
+        probs = registry.get_probs_texts(req.task, req.texts)
         # 注意：此端点返回未应用 temperature/threshold 的基础概率，便于做校准
         return ProbsResponse(task=req.task, labels=task.labels, probs=probs.tolist())
 

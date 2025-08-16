@@ -9,6 +9,7 @@
   python train_lgbm.py --csv training_data.csv --task "我的LGBM任务"
   python train_lgbm.py --csv data.csv --task "新任务" --params-file lgbm_params.json
 """
+
 import argparse
 import json
 from pathlib import Path
@@ -17,11 +18,14 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from scipy import sparse as sp
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
 
 try:
     import optuna
+
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
@@ -32,9 +36,9 @@ from ai_reviewer.embeddings import EmbeddingBackend
 
 
 def optimize_lgbm_params(
-    x_train: pd.DataFrame,
+    x_train,
     y_train: np.ndarray,
-    x_val: pd.DataFrame,
+    x_val,
     y_val: np.ndarray,
     n_classes: int,
     n_trials: int = 100,
@@ -245,19 +249,21 @@ def train_lightgbm_task(
         print("❌ 错误: 数据中的某些标签未在任务配置中定义。")
         return
 
-    # 3. 编码文本为向量
-    print("🧠 正在将文本编码为向量...")
+    # 3. 编码文本为向量（Embedding + TF-IDF -> hstack）
+    print("🧠 正在将文本编码为向量并构建 Embedding+TF-IDF 特征...")
     embedder = EmbeddingBackend(config.embedding_model, config.device, config.embed_batch_size, config.preprocess)
-    x_train_vec = embedder.encode(texts)
+    emb_train = embedder.encode(texts)
     y_train = np.array([label_map.get(label) for label in labels])
-    print("✅ 训练数据编码完成。")
-
-    # 将向量转换为带有特征名的 DataFrame 以避免警告
-    feature_names = [f"emb_{i}" for i in range(x_train_vec.shape[1])]
-    x_train_df = pd.DataFrame(x_train_vec, columns=feature_names)
+    # 基于训练文本拟合 TF-IDF；中文建议使用字符 n-gram
+    tfidf = TfidfVectorizer(analyzer="char", ngram_range=(2, 4), min_df=2, max_features=200000)
+    x_tfidf_train = tfidf.fit_transform(texts)
+    # 水平拼接：将 dense 的 embedding 转为 CSR 再与 TF-IDF hstack
+    x_train_csr = sp.hstack([sp.csr_matrix(emb_train), x_tfidf_train], format="csr").tocsr()
+    assert x_train_csr.shape is not None
+    print("✅ 训练数据特征构建完成。")
 
     # 4. 准备验证集
-    x_val_df = None
+    x_val_csr = None
     y_val = None
     if val_csv_path:
         print(f"📖 正在从 '{val_csv_path}' 加载外部验证集...")
@@ -269,35 +275,40 @@ def train_lightgbm_task(
             else:
                 val_texts = val_task_df["text"].tolist()
                 val_labels = val_task_df["label"].tolist()
-                x_val_vec = embedder.encode(val_texts)
+                emb_val = embedder.encode(val_texts)
+                x_tfidf_val = tfidf.transform(val_texts)
                 y_val = np.array([label_map.get(label) for label in val_labels])
-                x_val_df = pd.DataFrame(x_val_vec, columns=feature_names)
-                print(f"✅ 找到 {len(x_val_df)} 条验证数据。")
+                x_val_csr = sp.hstack([sp.csr_matrix(emb_val), x_tfidf_val], format="csr").tocsr()
+                assert x_val_csr.shape is not None
+                print(f"✅ 找到 {x_val_csr.shape[0]} 条验证数据。")
         except Exception as e:
             print(f"❌ 读取或处理验证 CSV 时出错: {e}")
             return
     else:
         print("🔪 正在从训练数据中划分验证集...")
-        x_train_df, x_val_df, y_train, y_val = train_test_split(
-            x_train_df, y_train, test_size=test_size, random_state=random_state, stratify=y_train
+        # 仅使用 embedding 做划分索引，然后按索引切 CSR，避免重复构建
+        idx = np.arange(x_train_csr.shape[0])
+        idx_tr, idx_val, y_train, y_val = train_test_split(
+            idx, y_train, test_size=test_size, random_state=random_state, stratify=y_train
         )
-        print(f"🔪 数据集划分: {len(x_train_df)} 训练, {len(x_val_df)} 验证。")
+        x_val_csr = x_train_csr[idx_val, :]
+        x_train_csr = x_train_csr[idx_tr, :]
+        print(f"🔪 数据集划分: {x_train_csr.shape[0]} 训练, {x_val_csr.shape[0]} 验证。")
 
     # 5. 训练 LightGBM 模型
     print("🏋️ 开始训练 LightGBM 模型...")
-    n_samples = len(x_train_df)
+    assert x_train_csr.shape is not None
+    n_samples = x_train_csr.shape[0]
     n_classes = len(task_config.labels)
 
     # 如果启用贝叶斯优化且有验证集
-    if use_bayesian_optimization and x_val_df is not None and y_val is not None and OPTUNA_AVAILABLE:
+    if use_bayesian_optimization and x_val_csr is not None and y_val is not None and OPTUNA_AVAILABLE:
         print("🔍 使用贝叶斯优化进行超参数调优...")
-        lgbm_params = optimize_lgbm_params(
-            x_train_df, y_train, x_val_df, y_val, n_classes, n_trials, random_state
-        )
+        lgbm_params = optimize_lgbm_params(x_train_csr, y_train, x_val_csr, y_val, n_classes, n_trials, random_state)
     elif use_bayesian_optimization and not OPTUNA_AVAILABLE:
         print("⚠️ 无法使用贝叶斯优化：optuna 未安装，回退到默认参数")
         lgbm_params = params or get_default_params(n_samples, n_classes, random_state)
-    elif use_bayesian_optimization and (x_val_df is None or y_val is None):
+    elif use_bayesian_optimization and (x_val_csr is None or y_val is None):
         print("⚠️ 无法使用贝叶斯优化：需要验证集，回退到默认参数")
         lgbm_params = params or get_default_params(n_samples, n_classes, random_state)
     else:
@@ -307,10 +318,10 @@ def train_lightgbm_task(
     print(f"🔧 使用以下 LightGBM 参数: {lgbm_params}")
 
     model = lgb.LGBMClassifier(**lgbm_params)
-    eval_set = [(x_val_df, y_val)] if x_val_df is not None and y_val is not None else None
+    eval_set = [(x_val_csr, y_val)] if x_val_csr is not None and y_val is not None else None
 
     model.fit(
-        x_train_df,
+        x_train_csr,
         y_train,
         eval_set=eval_set,
         eval_metric=lgbm_params.get("metric"),
@@ -320,9 +331,9 @@ def train_lightgbm_task(
 
     # 6. 在验证集上评估并保存结果
     eval_results = {}
-    if x_val_df is not None and y_val is not None:
+    if x_val_csr is not None and y_val is not None:
         print("📊 正在验证集上评估模型...")
-        y_pred = np.array(model.predict(x_val_df))
+        y_pred = np.array(model.predict(x_val_csr))
         accuracy = accuracy_score(y_val, y_pred)
         precision = precision_score(y_val, y_pred, average="macro")
         recall = recall_score(y_val, y_pred, average="macro")
@@ -341,6 +352,14 @@ def train_lightgbm_task(
     joblib.dump(model, model_path)
     print(f"💾 模型已保存到: {model_path}")
 
+    # 保存 TF-IDF 向量器，供推理端加载
+    try:
+        tfidf_path = model_path.with_suffix(model_path.suffix + ".tfidf.joblib")
+        joblib.dump(tfidf, tfidf_path)
+        print(f"💾 TF-IDF 向量器已保存到: {tfidf_path}")
+    except Exception as e:
+        print(f"⚠️ 保存 TF-IDF 向量器失败: {e}")
+
     meta_path = model_path.with_suffix(model_path.suffix + ".labels.json")
     meta_data = {
         "labels": task_config.labels,
@@ -348,6 +367,7 @@ def train_lightgbm_task(
         "source_csv": str(csv_path),
         "val_source_csv": str(val_csv_path) if val_csv_path else "from_training_set",
         "eval_results": eval_results,
+        "features": "emb|tfidf",
     }
     if task_config.threshold is not None:
         meta_data["threshold"] = task_config.threshold

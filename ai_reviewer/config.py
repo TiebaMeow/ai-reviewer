@@ -10,7 +10,7 @@ from pathlib import Path
 class TaskConfig:
     labels: list[str]
     model_path: str
-    classifier: str = "linear"  # 'linear' or 'lightgbm'
+    classifier: str = "linear"  # 'linear' | 'lightgbm' | 'hf' (HuggingFace本地序列分类模型)
     threshold: float | None = None
     temperature: float | None = None
 
@@ -48,9 +48,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         return AppConfig.from_dict(data)
 
     default_tasks = {
-        "滑坡": TaskConfig(labels=["无", "有"], model_path=str(Path("models") / "slippery_slope.joblib")),
-        "引战": TaskConfig(labels=["无", "有"], model_path=str(Path("models") / "incitement.joblib")),
-        "拉踩": TaskConfig(labels=["无", "有"], model_path=str(Path("models") / "unfair_comparison.joblib")),
-        "AI生成": TaskConfig(labels=["否", "是"], model_path=str(Path("models") / "ai_generation.joblib")),
+        "违规内容": TaskConfig(labels=["否", "是"], model_path=str(Path("models") / "违规内容.joblib")),
     }
     return AppConfig(tasks=default_tasks)

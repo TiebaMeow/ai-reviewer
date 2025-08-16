@@ -11,8 +11,9 @@ _一个可扩展的文本分类服务，基于 SentenceTransformer 模型 + SGDC
 ## 功能特性
 
 - 支持 SGDClassifier 和 LightGBM 分类器
+- 支持 HuggingFace 本地序列分类模型（HuggingFace Transformers）
 - 动态注册自定义任务与标签，在线增量学习（/update）
-- 文本预处理与向量池化（支持自定义模型、批大小、是否启用预处理）
+- 支持文本预处理与向量池化，以及各类参数调整
 - 二分类支持阈值（threshold），多分类支持温度缩放（temperature）
 - 评测支持 macro 指标与困难样本（hardest）输出；支持困难样本回流训练
 - 简易自动校准：阈值/温度一键搜索并写回
@@ -56,7 +57,11 @@ _一个可扩展的文本分类服务，基于 SentenceTransformer 模型 + SGDC
    classifier = "linear"
    ```
 
+   选择分类器后端前，请先阅读[注意事项](#注意事项)
+
    如果你指定了 `classifier = "lightgbm"`，请先运行[离线训练脚本](#lightgbm批量训练脚本train_lgbmpy)
+
+   如果你指定了 `classifier = "hf"`，请先运行[微调脚本](#hf序列分类模型训练脚本train_hf_classifierpy)，并将 `model_path` 指定为微调后的模型路径。
 
 3. 运行服务
 
@@ -196,6 +201,48 @@ uv run python train_lgbm.py \
 | `bagging_fraction` | 0.4-1.0 | 样本采样比例 |
 | `bagging_freq` | 1-7 | 采样频率 |
 
+### HF序列分类模型训练脚本（train_hf_classifier.py）
+
+该分类器其实是在预训练模型顶部加了一个简单的线性分类层，可以更好地利用注意力机制以提高上下文感知效果。
+
+1. 准备训练数据，格式与训练数据相同
+
+2. 运行训练脚本
+
+    ```bash
+    uv run python train_hf_classifier.py --csv training_data.csv
+    ```
+
+3. 常用参数
+
+```bash
+uv run python train_hf_classifier.py \
+    --base-model richinfoai/ritrieve_zh_v1 \
+    --csv training_data.csv \
+    --output models/hf-seqcls \
+    --test-size 0.1 \
+    --epochs 3 \
+    --batch-size 16 \
+    --fp16
+```
+
+| 参数 | 默认值 | 说明 |
+|-----|--------|------|
+| `--base-model` | 必需 | 基底模型名称 |
+| `--csv` | 必需 | CSV 训练数据文件路径 |
+| `--output` | 必需 | 输出模型文件路径 |
+| `--test-size` | `0.1` | 测试集比例 |
+| `--epochs` | `3` | 训练轮数 |
+| `--batch-size` | `16` | 批次大小 |
+| `--lr` | `2e-5` | 学习率 |
+| `--weight-decay` | `0.01` | 权重衰减 |
+| `--warmup-ratio` | `0.06` | 学习率预热比例 |
+| `--max-length` | `256` | 输入序列的最大长度 |
+| `--gradient-accumulation-steps` | `1` | 梯度累积 |
+| `--fp16` | 可选 | 启用混合精度训练 |
+| `--seed` | `42` | 用于数据划分和模型训练的随机种子 |
+| `--logging-steps` | `50` | 日志记录步数 |
+
 ### 评测脚本
 
 1. 准备评测数据，格式与训练数据相同
@@ -249,6 +296,11 @@ uv run python train_lgbm.py \
 
 - LightGBM 分类器仅支持离线训练，建议训练完成后再启动服务。
 - 如果你熟悉 LightGBM 的调参优化，可以尝试创建参数文件 `params.json` 手动指定参数进行训练。
+
+### HF序列分类模型
+
+- Hugging Face Sequence Classification 模型支持更复杂的文本分类任务，适合需要深度学习模型的场景。同样仅支持离线训练。
+- 该分类模型会消耗更多的资源，请根据需求选择。
 
 ## API
 

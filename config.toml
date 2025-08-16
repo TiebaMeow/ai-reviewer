@@ -1,7 +1,9 @@
 embedding_model = "richinfoai/ritrieve_zh_v1"
+# 如果仅使用 hf classifier，请将 device 设为 "cpu" 以节省 embedding model 加载资源，hf 后端会自动使用 gpu
 device = "auto"
 
 [tasks."违规内容"]
 labels = ["否", "是"]
+# 如果使用 hf classifier，请将 model_path 指向微调后模型的本地目录，如 models/hf-seqcls（包含 config.json、model.safetensors、tokenizer.json 等文件）。
 model_path = "models/违规内容.joblib"
 classifier = "lightgbm"
